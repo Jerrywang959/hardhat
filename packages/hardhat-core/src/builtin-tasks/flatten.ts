@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import chalk from "chalk";
 
 import { subtask, task, types } from "../internal/core/config/config-env";
 import { HardhatError } from "../internal/core/errors";
@@ -53,12 +54,61 @@ function getSortedFiles(dependenciesGraph: DependencyGraph) {
   }
 }
 
-function getFileWithoutImports(resolvedFile: ResolvedFile) {
+function getFileWithoutImports(fileContent: string) {
   const IMPORT_SOLIDITY_REGEX = /^\s*import(\s+)[\s\S]*?;\s*$/gm;
 
-  return resolvedFile.content.rawContent
-    .replace(IMPORT_SOLIDITY_REGEX, "")
-    .trim();
+  return fileContent.replace(IMPORT_SOLIDITY_REGEX, "").trim();
+}
+
+function getLicense(resolvedFile: ResolvedFile) {
+  const LicenseRegex =
+    /\s*\/\/(\s+)SPDX-License-Identifier:(\s+)([a-zA-Z0-9._-]+)/gm;
+  const match = resolvedFile.content.rawContent.match(LicenseRegex);
+  return match ? match[0] : "";
+}
+
+function combineLicenses(licenses: Map<string, string>) {
+  const licenseNames: string[] = [];
+  for (const value of licenses.values()) {
+    licenseNames.push(value.split(":")[1].trim());
+  }
+  const uniqueLicenseNames = [...new Set(licenseNames)];
+  if (uniqueLicenseNames.length === 1) {
+    return `// SPDX-License-Identifier: ${uniqueLicenseNames[0]}`;
+  } else {
+    return `// SPDX-License-Identifier: ${uniqueLicenseNames.join(" AND ")}`;
+  }
+}
+
+function combinePragmas(pragmas: Map<string, string>, warnings : string[]) {
+  const uniquePragmas = [...new Set(Array.from(pragmas.values()))];
+
+  for (const value of pragmas.values()) {
+    const name = value.split(" ")[1];
+    const version = value.split(" ")[2];
+    if (
+      ["abicoder", "experimental"].includes(name) &&
+      version.toLowerCase().includes("v2")
+    ) {
+      if (uniquePragmas.length > 1) {
+        warnings.push(`INCOMPATIBLE PRAGMA DIRECTIVES: ${value} was used`);
+      }
+      return value;
+    }
+  }
+
+  // just return a pragma if no abiencoder was found
+  const out = Array.from(pragmas.values())[0];
+  if (uniquePragmas.length > 1) {
+    warnings.push(`INCOMPATIBLE PRAGMA DIRECTIVES: ${out} was used`);
+  }
+  return out;
+}
+
+function getPragma(resolvedFile: ResolvedFile) {
+  const PragmaRegex = /pragma(\s)([a-zA-Z]+)(\s)([a-zA-Z0-9^.]+);/gm;
+  const match = resolvedFile.content.rawContent.match(PragmaRegex);
+  return match ? match[0] : "";
 }
 
 subtask(
@@ -75,20 +125,62 @@ subtask(
     let flattened = "";
 
     if (dependencyGraph.getResolvedFiles().length === 0) {
-      return flattened;
+      return [flattened, []];
     }
 
     const packageJson = await getPackageJson();
     flattened += `// Sources flattened with hardhat v${packageJson.version} https://hardhat.org`;
 
     const sortedFiles = getSortedFiles(dependencyGraph);
+    const licenses = new Map();
+    const pragmas = new Map();
+    let warnings : string[] = [];
+
+    for (const file of sortedFiles) {
+      const pragma = getPragma(file);
+      if (pragma !== "") {
+        pragmas.set(file.sourceName, pragma);
+      }
+
+      const license = getLicense(file);
+      if (license !== "") {
+        licenses.set(file.sourceName, license);
+      }
+    }
 
     for (const file of sortedFiles) {
       flattened += `\n\n// File ${file.getVersionedName()}\n`;
-      flattened += `\n${getFileWithoutImports(file)}\n`;
+
+      if (pragmas.size > 0 && !pragmas.has(file.sourceName)) {
+        warnings.push(`MISSING PRAGMA: File ${file.getVersionedName()} needs a pragma`);
+      }
+
+      if (licenses.size > 0 && !licenses.has(file.sourceName)) {
+        warnings.push(`MISSING LICENSE: File ${file.getVersionedName()} needs a license`)
+      }
+
+      const newFileContent = file.content.rawContent
+        .replace(
+          licenses.has(file.sourceName) ? licenses.get(file.sourceName) : "",
+          ""
+        )
+        .replace(
+          pragmas.has(file.sourceName) ? pragmas.get(file.sourceName) : "",
+          ""
+        );
+      flattened += `\n${getFileWithoutImports(newFileContent)}\n`;
     }
 
-    return flattened.trim();
+    if (licenses.size > 0) {
+      const combined = combineLicenses(licenses);
+      flattened = `${combined}\n\n${flattened}`;
+    }
+
+    if (pragmas.size > 0) {
+      flattened = `${combinePragmas(pragmas, warnings)}\n\n${flattened}`;
+    }
+
+    return [flattened.trim(), warnings];
   });
 
 subtask(TASK_FLATTEN_GET_DEPENDENCY_GRAPH)
@@ -122,5 +214,12 @@ task(TASK_FLATTEN, "Flattens and prints contracts and their dependencies")
     types.inputFile
   )
   .setAction(async ({ files }: { files: string[] | undefined }, { run }) => {
-    console.log(await run(TASK_FLATTEN_GET_FLATTENED_SOURCE, { files }));
+    const [flattened, warnings] = await run(TASK_FLATTEN_GET_FLATTENED_SOURCE, {
+      files,
+    });
+    console.log(flattened);
+    // print warnings after the flattened contract
+    for (const warning of warnings) {
+      console.warn(chalk.yellow(warning));
+    }
   });
